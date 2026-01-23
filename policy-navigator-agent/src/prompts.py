@@ -1,8 +1,9 @@
-import json
-
+# ==================================================
+# Embedded Sample Policy Text (for demo / fallback)
+# ==================================================
 
 SAMPLE_POLICY_TEXT = """
-정책명: 청년 주거·취업 지원 패키지(가상 예시)
+정책명: 청년 주거·취업 지원 패키지 (가상 예시)
 대상: 만 19~34세, 수도권 거주, 중위소득 150% 이하, 미혼
 내용:
 - 월세 지원: 월 20만원, 최대 12개월
@@ -14,36 +15,62 @@ SAMPLE_POLICY_TEXT = """
 """.strip()
 
 
+# ==================================================
+# Solar Planner Prompt Template
+# ==================================================
+
 SOLAR_PLANNER_TEMPLATE = """
-역할: 당신은 정부 정책 문서를 개인 맞춤형 행동 가이드로 바꾸는 오케스트레이터다.
-규칙:
-- 요약 금지, 행동 중심, 피드백 루프 유지
-- 판단/선택지/시뮬레이션/다음 행동/추가 질문을 포함
-- 사용자의 상황을 기준으로 실제 실행 가능한 단계로 정리
-- 아래 섹션 헤더를 반드시 포함
+역할:
+너는 정부 정책 문서를 읽고, 이를 개인의 상황에 맞는 **행동 가능한 선택지**로 변환하는 AI Agent 오케스트레이터다.
+너의 목적은 정보를 설명하는 것이 아니라, 사용자가 **다음에 무엇을 해야 할지 결정하도록 돕는 것**이다.
+
+핵심 원칙:
+- 단순 요약 금지 (정책 나열, 설명 위주의 답변 금지)
+- 행동 중심 사고 유지
+- 판단 → 선택지 → 결과 예측 → 행동 → 피드백 질문의 흐름을 반드시 따른다
+- 사용자의 현재 상황을 기준으로 현실적으로 실행 가능한 내용만 제안한다
+
+출력 규칙:
+- 아래 5개 섹션 헤더를 반드시 모두 포함한다
+- 각 섹션은 구체적이고 명확해야 하며, 추상적인 표현을 피한다
+- 정보가 부족한 경우, 이를 숨기지 말고 [추가 질문]에서 명확히 질문한다
 
 사용자 프로필:
 {profile}
 
-정책 원문:
+정책 문서 내용:
 {policy_text}
 
-추출 정보(JSON):
-{extracted_json}
-
-출력 형식:
+출력 형식 (형식 유지 필수):
 [판단 요약]
+- 이 정책이 사용자에게 왜 중요한지 한 단락으로 설명
+
 [선택지]
+- 사용자가 선택할 수 있는 행동 경로를 2~3가지 제시
+
 [시뮬레이션]
+- 각 선택지를 따를 경우 예상되는 결과를 간단히 비교
+
 [추천 행동]
+- 현재 사용자에게 가장 합리적인 다음 행동을 단계별로 제시
+
 [추가 질문]
+- 판단을 더 정확히 하기 위해 필요한 정보 질문 (있을 경우)
 """.strip()
 
 
-def build_solar_prompt(profile: str, policy_text: str, extracted_info: dict) -> str:
-    extracted_json = json.dumps(extracted_info, ensure_ascii=False, indent=2)
+# ==================================================
+# Prompt Builder
+# ==================================================
+
+def build_solar_prompt(profile: str, policy_text: str) -> str:
+    """
+    Build a structured planner prompt for Solar.
+    The prompt is designed to force agentic (plan-and-act) behavior,
+    not summarization.
+    """
+
     return SOLAR_PLANNER_TEMPLATE.format(
         profile=profile,
         policy_text=policy_text,
-        extracted_json=extracted_json,
     )

@@ -1,14 +1,30 @@
-import json
-from typing import Dict
-
 import requests
+from openai import OpenAI
 
 from config import MOCK_MODE, SOLAR_MODEL, UPSTAGE_API_KEY, UPSTAGE_BASE_URL
 
 
-SOLAR_PATH = "/v1/solar"  # TODO: Upstage 문서에 맞춰 수정
-DOCUMENT_PARSE_PATH = "/v1/document-parse"  # TODO: Upstage 문서에 맞춰 수정
-INFORMATION_EXTRACT_PATH = "/v1/information-extract"  # TODO: Upstage 문서에 맞춰 수정
+DOCUMENT_PARSE_PATH = "/document-digitization"  # TODO: Upstage 문서에 맞춰 수정
+
+
+def _with_version(base_url: str) -> str:
+    base = base_url.rstrip("/")
+    return base if base.endswith("/v1") else f"{base}/v1"
+
+
+def _without_version(base_url: str) -> str:
+    base = base_url.rstrip("/")
+    return base[:-3] if base.endswith("/v1") else base
+
+
+def _strip_solar(base_url: str) -> str:
+    base = base_url.rstrip("/")
+    return base[:-6] if base.endswith("/solar") else base
+
+
+BASE_URL = _without_version(_strip_solar(UPSTAGE_BASE_URL))
+VERSIONED_BASE_URL = _with_version(BASE_URL)
+SOLAR_BASE_URL = f"{VERSIONED_BASE_URL}/solar"
 
 
 MOCK_SOLAR_RESPONSE = """
@@ -43,44 +59,23 @@ MOCK_PARSED_DOC = {
 }
 
 
-MOCK_EXTRACTED_INFO = {
-    "target": "만 19~34세, 수도권 거주, 중위소득 150% 이하, 미혼",
-    "benefits": [
-        "월세 지원: 월 20만원, 최대 12개월",
-        "직무교육 바우처: 1회 50만원",
-        "구직활동비: 월 10만원, 최대 6개월",
-    ],
-    "documents": [
-        "주민등록등본",
-        "소득증빙",
-        "재직 또는 구직 확인서",
-    ],
-    "notes": "중복 수혜 제한, 허위 서류 제출 시 환수",
-}
-
-
-def _headers() -> Dict[str, str]:
-    return {
-        "Authorization": f"Bearer {UPSTAGE_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-
 def call_solar(prompt: str) -> str:
     if MOCK_MODE:
         return MOCK_SOLAR_RESPONSE
 
-    url = f"{UPSTAGE_BASE_URL}{SOLAR_PATH}"
-    payload = {
-        "model": SOLAR_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-    }
+    client = OpenAI(
+        api_key=UPSTAGE_API_KEY,
+        base_url=SOLAR_BASE_URL,
+    )
     # TODO: Upstage 문서에 맞춰 수정
-    response = requests.post(url, headers=_headers(), json=payload, timeout=60)
-    response.raise_for_status()
-    data = response.json()
-    # TODO: Upstage 문서에 맞춰 수정
-    return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    response = client.chat.completions.create(
+        model=SOLAR_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.7,
+        max_tokens=4096,
+        stream=False,
+    )
+    return response.choices[0].message.content
 
 
 def call_document_parse(pdf_path: str) -> dict:
@@ -89,22 +84,20 @@ def call_document_parse(pdf_path: str) -> dict:
         parsed["source"] = pdf_path
         return parsed
 
-    url = f"{UPSTAGE_BASE_URL}{DOCUMENT_PARSE_PATH}"
+    url = f"{VERSIONED_BASE_URL}{DOCUMENT_PARSE_PATH}"
+    headers = {"Authorization": f"Bearer {UPSTAGE_API_KEY}"}
+    data = {
+        "model": "document-parse-nightly",
+        "mode": "auto",
+        "ocr": "auto",
+        "chart_recognition": True,
+        "coordinates": True,
+        "output_formats": '["html"]',
+        "base64_encoding": '["figure"]',
+    }
     # TODO: Upstage 문서에 맞춰 수정
     with open(pdf_path, "rb") as file_handle:
-        files = {"file": file_handle}
-        response = requests.post(url, headers={"Authorization": f"Bearer {UPSTAGE_API_KEY}"}, files=files, timeout=60)
-    response.raise_for_status()
-    return response.json()
-
-
-def call_information_extract(parsed_doc: dict) -> dict:
-    if MOCK_MODE:
-        return dict(MOCK_EXTRACTED_INFO)
-
-    url = f"{UPSTAGE_BASE_URL}{INFORMATION_EXTRACT_PATH}"
-    payload = {"document": parsed_doc}
-    # TODO: Upstage 문서에 맞춰 수정
-    response = requests.post(url, headers=_headers(), json=payload, timeout=60)
+        files = {"document": file_handle}
+        response = requests.post(url, headers=headers, files=files, data=data, timeout=60)
     response.raise_for_status()
     return response.json()
