@@ -12,11 +12,11 @@ DEFAULT_PDF_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "sample
 
 
 REQUIRED_HEADERS = [
-    "[판단 요약]",
-    "[선택지]",
-    "[시뮬레이션]",
-    "[추천 행동]",
-    "[추가 질문]",
+    "[자격 판단]",
+    "[신청 가능 정책]",
+    "[예상 혜택]",
+    "[다음 단계]",
+    "[확인 필요 사항]",
 ]
 
 
