@@ -1,3 +1,4 @@
+import json
 import requests
 from openai import OpenAI
 
@@ -5,6 +6,7 @@ from config import SOLAR_MODEL, UPSTAGE_API_KEY, UPSTAGE_BASE_URL
 
 
 DOCUMENT_PARSE_PATH = "/document-digitization"
+INFORMATION_EXTRACT_PATH = "/information-extraction"
 
 
 def _ensure_v1(base_url: str) -> str:
@@ -27,7 +29,7 @@ def call_solar(prompt: str) -> str:
         model=SOLAR_MODEL,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.7,
-        max_tokens=16384,
+        max_tokens=4096,
         stream=False,
     )
     return response.choices[0].message.content
@@ -51,3 +53,25 @@ def call_document_parse(pdf_path: str) -> dict:
         response = requests.post(url, headers=headers, files=files, data=data, timeout=120)
     response.raise_for_status()
     return response.json()
+
+
+def call_information_extract(text: str, schema: dict) -> dict:
+    """Information Extraction(Universal Extraction) API 호출."""
+    client = OpenAI(
+        api_key=UPSTAGE_API_KEY,
+        base_url=f"{VERSIONED_BASE_URL}{INFORMATION_EXTRACT_PATH}",
+    )
+    response = client.chat.completions.create(
+        model="information-extract",
+        messages=[{"role": "user", "content": text}],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "policy_schema",
+                "schema": schema,
+            },
+        },
+        timeout=120,
+    )
+    content = response.choices[0].message.content
+    return json.loads(content) if isinstance(content, str) else content

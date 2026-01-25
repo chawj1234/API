@@ -112,6 +112,8 @@ SOLAR_PLANNER_TEMPLATE = """
 정책 문서 내용:
 {policy_text}
 
+{ie_extract}
+
 {agent_plan}
 
 {answered_fields}
@@ -139,6 +141,7 @@ def build_solar_prompt(
     policy_text: str,
     agent_plan: Optional[str] = None,
     answered_fields: Optional[str] = None,
+    ie_extract: Optional[str] = None,
 ) -> str:
     """
     Build a structured planner prompt for Solar.
@@ -149,6 +152,7 @@ def build_solar_prompt(
     return SOLAR_PLANNER_TEMPLATE.format(
         profile=profile,
         policy_text=policy_text,
+        ie_extract=_format_ie_extract(ie_extract),
         agent_plan=_format_agent_plan(agent_plan),
         answered_fields=_format_answered_fields(answered_fields),
     )
@@ -163,12 +167,15 @@ SOLAR_PLAN_TEMPLATE = """
 - 확실한 조건과 불확실한 조건을 분리한다
 - 부족한 정보는 질문으로 정리한다
 - 추천 행동 후보를 리스트업한다
+- 이미 제공된 정보는 다시 묻지 않고, 프로필과 모순되는 질문을 만들지 않는다
 
 사용자 프로필:
 {profile}
 
 정책 문서 내용:
 {policy_text}
+
+{ie_extract}
 
 출력 형식 (JSON만 출력):
 {{
@@ -183,13 +190,14 @@ SOLAR_PLAN_TEMPLATE = """
 """.strip()
 
 
-def build_plan_prompt(profile: str, policy_text: str) -> str:
+def build_plan_prompt(profile: str, policy_text: str, ie_extract: Optional[str] = None) -> str:
     """
     Build a plan prompt for Solar to output JSON-only planning metadata.
     """
     return SOLAR_PLAN_TEMPLATE.format(
         profile=profile,
         policy_text=policy_text,
+        ie_extract=_format_ie_extract(ie_extract),
     )
 
 
@@ -203,3 +211,9 @@ def _format_answered_fields(answered_fields: Optional[str]) -> str:
     if not answered_fields:
         return ""
     return f"이미 제공된 답변:\n{answered_fields}"
+
+
+def _format_ie_extract(ie_extract: Optional[str]) -> str:
+    if not ie_extract:
+        return ""
+    return f"정보 추출 요약(참고용):\n{ie_extract}"
