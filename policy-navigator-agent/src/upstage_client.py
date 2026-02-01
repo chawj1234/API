@@ -20,20 +20,35 @@ VERSIONED_BASE_URL = _ensure_v1(UPSTAGE_BASE_URL)
 SOLAR_BASE_URL = VERSIONED_BASE_URL
 
 
-def call_solar(prompt: str) -> str:
-    """Solar 모델을 호출하여 응답을 반환."""
+def call_solar(
+    prompt: str,
+    *,
+    temperature: float = 0.2,
+    max_tokens: int = 16384,
+    reasoning_effort: str | None = None,
+) -> str:
+    """Solar 모델을 호출하여 응답을 반환.
+
+    reasoning_effort: Solar Pro 2는 기본 꺼짐, "high"로 활성화.
+                      Solar Pro 3는 high(60%)/medium(30%)/low(꺼짐).
+    """
     client = OpenAI(
         api_key=UPSTAGE_API_KEY,
         base_url=SOLAR_BASE_URL,
     )
-    response = client.chat.completions.create(
-        model=SOLAR_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.7,
-        max_tokens=4096,
-        stream=False,
-    )
-    return response.choices[0].message.content
+    kwargs: dict = {
+        "model": SOLAR_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": False,
+    }
+    if reasoning_effort is not None:
+        kwargs["reasoning_effort"] = reasoning_effort
+    response = client.chat.completions.create(**kwargs)
+    choice = response.choices[0] if response.choices else None
+    content = choice.message.content if choice and choice.message else None
+    return content if content is not None else ""
 
 
 def call_document_parse(pdf_path: str) -> dict:

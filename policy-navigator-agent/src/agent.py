@@ -1,15 +1,25 @@
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Dict, Any
 
-from prompts import build_solar_prompt, build_plan_prompt
+from prompts import (
+    build_solar_prompt,
+    build_plan_prompt,
+    build_question_filter_prompt,
+    build_profile_extract_prompt,
+    build_profile_parse_prompt,
+    format_profile_structured,
+)
 from upstage_client import call_document_parse, call_information_extract, call_solar
 
 
 # 기본 PDF 경로 (data 폴더 내) — 금융·재정·조세 정책
 DEFAULT_PDF_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "finance_policy.pdf")
 MAX_POLICY_TEXT_CHARS = 20000
+# Plan 전용 정책 텍스트 길이 제한. None이면 전체 사용. 빈 응답 원인 파악 시 6000 등으로 줄여서 테스트.
+PLAN_MAX_POLICY_CHARS: Optional[int] = None
 
 
 REQUIRED_HEADERS = [
@@ -40,6 +50,16 @@ IE_SCHEMA = {
 }
 
 
+def _clean_terminal_output(text: str) -> str:
+    """터미널 가독성: 굵은글씨(**...**) 제거."""
+    s = text.strip()
+    for _ in range(5):
+        prev, s = s, re.sub(r"\*\*([^*]*)\*\*", r"\1", s)
+        if s == prev:
+            break
+    return s.strip()
+
+
 def _ensure_required_headers(text: str) -> str:
     """출력에 필수 섹션 헤더가 포함되어 있는지 확인."""
     missing = [header for header in REQUIRED_HEADERS if header not in text]
@@ -53,17 +73,39 @@ def _ensure_required_headers(text: str) -> str:
 
 
 def _policy_text_from_parsed_doc(parsed_doc: Dict[str, Any]) -> str:
-    """Document Parse 응답을 텍스트로 변환."""
+    """Document Parse 응답을 텍스트로 변환.
+
+    우선 content.text / content.html, 그다음 elements[] 내 paragraph/heading 등
+    content.text를 모아 사용. 본문이 elements에만 있는 API 응답 구조 대응.
+    """
     for key in ("html", "text", "content"):
         val = parsed_doc.get(key)
         if isinstance(val, str) and val.strip():
             return _normalize_policy_text(val)
         if isinstance(val, dict):
-            for nested_key in ("html", "text"):
+            for nested_key in ("text", "html"):
                 nested_val = val.get(nested_key)
                 if isinstance(nested_val, str) and nested_val.strip():
                     return _normalize_policy_text(nested_val)
-
+    # content.text가 비어 있고 elements에 본문이 있는 경우
+    elements = parsed_doc.get("elements") or parsed_doc.get("content", {}).get("elements")
+    if isinstance(elements, list):
+        parts = []
+        for el in elements:
+            if not isinstance(el, dict):
+                continue
+            cat = el.get("category") or el.get("type") or ""
+            content = el.get("content")
+            if isinstance(content, dict):
+                t = content.get("text") or content.get("markdown") or content.get("html")
+            elif isinstance(content, str):
+                t = content
+            else:
+                t = None
+            if t and str(t).strip():
+                parts.append(str(t).strip())
+        if parts:
+            return _normalize_policy_text(" ".join(parts))
     try:
         return _normalize_policy_text(json.dumps(parsed_doc, ensure_ascii=False))
     except Exception:
@@ -79,123 +121,118 @@ def _normalize_policy_text(raw_text: str) -> str:
     return text[:MAX_POLICY_TEXT_CHARS]
 
 
-def _extract_profile_facts(profile: str) -> Dict[str, Any]:
-    """프로필 문자열에서 확정 사실을 최소한으로 추출."""
-    facts: Dict[str, Any] = {
-        "marital_status": None,
-        "has_children": None,
-        "is_metropolitan": None,
-        "location": None,
-        "is_student": None,
-    }
-
-    normalized = profile.strip()
-
-    if "미혼" in normalized:
-        facts["marital_status"] = "미혼"
-        if "자녀" not in normalized:
-            facts["has_children"] = False
-    elif "기혼" in normalized:
-        facts["marital_status"] = "기혼"
-
-    if any(token in normalized for token in ["자녀 없음", "무자녀", "자녀0"]):
-        facts["has_children"] = False
-    elif "자녀" in normalized:
-        facts["has_children"] = True
-
-    for location in ["수도권", "서울", "경기", "인천", "부산", "대구"]:
-        if location in normalized:
-            facts["location"] = location
-            break
-
-    if facts["location"] in {"수도권", "서울", "경기", "인천"}:
-        facts["is_metropolitan"] = True
-    elif facts["location"]:
-        facts["is_metropolitan"] = False
-
-    if any(token in normalized for token in ["대학", "재학"]):
-        facts["is_student"] = True
-
-    return facts
+def _get_structured_profile(profile: str) -> str:
+    """
+    프로필 문자열을 구조화하여 반환. Plan/질문필터에 전달.
+    실패 시 원본 profile 반환.
+    """
+    try:
+        prompt = build_profile_parse_prompt(profile=profile)
+        output = call_solar(prompt, reasoning_effort=None)
+        parsed = None
+        try:
+            parsed = json.loads(output)
+        except json.JSONDecodeError:
+            start = output.find("{")
+            end = output.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                parsed = json.loads(output[start : end + 1])
+        if isinstance(parsed, dict) and parsed:
+            structured = format_profile_structured(parsed)
+            if structured:
+                return structured
+    except Exception:
+        pass
+    return profile.strip()
 
 
-def _should_skip_question(question_text: str, field_name: Optional[str], profile: str) -> bool:
-    """프로필과 모순되거나 이미 제공된 정보는 질문에서 제외."""
-    if field_name and f"{field_name}:" in profile:
-        return True
+def _filter_questions_llm(profile: str, questions: Any) -> list:
+    """LLM 기반 질문 필터링: 프로필에 이미 답이 있는 질문은 제외."""
+    raw = list(questions or [])
+    if not raw:
+        return []
 
-    facts = _extract_profile_facts(profile)
-    text = question_text.strip()
+    # 질문이 dict 리스트인지 확인
+    normalized = []
+    for item in raw:
+        if isinstance(item, dict) and (item.get("question") or item.get("field")):
+            normalized.append(item)
+        elif isinstance(item, str) and item.strip():
+            normalized.append({"field": None, "question": item.strip()})
 
-    if facts["has_children"] is False and "자녀" in text:
-        return True
+    if not normalized:
+        return []
 
-    if facts["marital_status"] and facts["marital_status"] in text:
-        return True
+    try:
+        prompt = build_question_filter_prompt(profile=profile, questions=normalized)
+        output = call_solar(prompt, reasoning_effort=None)
 
-    if facts["is_metropolitan"] is True and any(
-        token in text for token in ["농어촌", "인구감소지역", "비수도권", "지방"]
-    ):
-        return True
+        # JSON 배열 파싱 (앞뒤 설명 제거)
+        parsed = None
+        try:
+            parsed = json.loads(output)
+        except json.JSONDecodeError:
+            start = output.find("[")
+            end = output.rfind("]")
+            if start != -1 and end != -1 and end > start:
+                parsed = json.loads(output[start : end + 1])
 
-    if facts["is_metropolitan"] is True and "수도권" in text:
-        return True
+        if isinstance(parsed, list) and parsed:
+            filtered = [x for x in parsed if isinstance(x, dict) and (x.get("question") or x.get("field"))]
+            return filtered
+        if isinstance(parsed, list):
+            return []
+    except Exception:
+        pass
 
-    if facts["is_student"] is True and any(token in text for token in ["재학", "대학", "대학(원)"]):
-        return True
-
-    return False
-
-
-def _filter_questions(profile: str, questions: Any) -> list:
-    """질문 목록에서 중복/모순 질문을 제거."""
-    filtered = []
-    for item in questions or []:
-        if isinstance(item, dict):
-            field_name = item.get("field")
-            question_text = item.get("question") or field_name or ""
-        else:
-            field_name = None
-            question_text = str(item)
-
-        if not question_text:
-            continue
-
-        if _should_skip_question(question_text, field_name, profile):
-            continue
-
-        filtered.append(item)
-
-    return filtered
+    return normalized
 
 
 def _parse_plan_json(raw_text: str) -> Optional[Dict[str, Any]]:
-    """Solar Plan 출력에서 JSON을 추출."""
+    """Solar Plan 출력에서 JSON을 추출.
+
+    Solar Pro 3 reasoning_effort=high 시 추론 블록(<think>...</think>) 또는
+    마크다운(```json ... ```)으로 감싼 JSON이 올 수 있으므로 제거 후 파싱.
+    """
+    if not raw_text or not raw_text.strip():
+        return None
+    text = raw_text.strip()
+    # <think>...</think> 블록 제거 (reasoning 출력)
+    if "</think>" in text:
+        text = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.DOTALL)
+        text = text.strip()
+    # ```json ... ``` 또는 ``` ... ``` 코드블록에서 내용만 추출
+    code_block = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+    if code_block:
+        text = code_block.group(1).strip()
     try:
-        parsed = json.loads(raw_text)
+        parsed = json.loads(text)
         return parsed if isinstance(parsed, dict) else None
     except json.JSONDecodeError:
-        start = raw_text.find("{")
-        end = raw_text.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            return None
-        try:
-            parsed = json.loads(raw_text[start : end + 1])
-            return parsed if isinstance(parsed, dict) else None
-        except json.JSONDecodeError:
-            return None
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        parsed = json.loads(text[start : end + 1])
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        return None
 
 
 def _plan_phase(profile: str, policy_text: str, ie_extract: Optional[str]) -> Dict[str, Any]:
     """Solar Plan 단계: 조건 분석 및 질문 생성."""
-    prompt = build_plan_prompt(profile=profile, policy_text=policy_text, ie_extract=ie_extract)
-    output = call_solar(prompt)
+    plan_text = (
+        policy_text[:PLAN_MAX_POLICY_CHARS] if PLAN_MAX_POLICY_CHARS else policy_text
+    )
+    prompt = build_plan_prompt(profile=profile, policy_text=plan_text, ie_extract=ie_extract)
+    output = call_solar(prompt, reasoning_effort="medium", max_tokens=8192)
     parsed = _parse_plan_json(output)
     
     if parsed:
         return parsed
     
-    # JSON 파싱 실패 시 기본값 반환
     return {
         "certain_conditions": [],
         "uncertain_conditions": [],
@@ -208,8 +245,7 @@ def _safe_information_extract(pdf_path: str) -> Optional[str]:
     """Information Extraction 결과를 안전하게 반환. PDF 파일 경로를 넘긴다."""
     try:
         result = call_information_extract(document_path=pdf_path, schema=IE_SCHEMA)
-    except Exception as e:
-        print(f"[WARN] IE 실패: {e}")
+    except Exception:
         return None
 
     try:
@@ -228,34 +264,46 @@ def _append_profile_field(profile: str, field_name: str, value: str) -> str:
     return f"{field_name}: {value}"
 
 
-def _update_profile_from_message(profile: str, user_message: str) -> str:
-    """사용자 메시지에서 프로필 정보 추출 및 업데이트."""
-    updated_profile = profile.strip()
+def _update_profile_from_message_llm(
+    profile: str,
+    user_message: str,
+    question_text: str = "",
+    field_name: Optional[str] = None,
+) -> str:
+    """LLM 기반: 질문 맥락 + 사용자 답변으로 프로필 정보 추출 및 병합."""
+    if not user_message or not user_message.strip():
+        return profile.strip()
 
-    age_match = re.search(r"(\d{2})\s*(세|살)", user_message)
-    if age_match:
-        updated_profile = _append_profile_field(updated_profile, "나이", f"{age_match.group(1)}세")
+    try:
+        prompt = build_profile_extract_prompt(
+            user_message=user_message.strip(),
+            question_text=question_text or "",
+            field_name=field_name or "",
+        )
+        output = call_solar(prompt, reasoning_effort=None)
 
-    income_match = re.search(r"월\s*(\d{2,4})\s*(만|만원)?", user_message)
-    if income_match:
-        updated_profile = _append_profile_field(updated_profile, "소득", f"월{income_match.group(1)}만원")
+        parsed = None
+        try:
+            parsed = json.loads(output)
+        except json.JSONDecodeError:
+            start = output.find("{")
+            end = output.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                parsed = json.loads(output[start : end + 1])
 
-    if "미혼" in user_message:
-        updated_profile = _append_profile_field(updated_profile, "혼인", "미혼")
-    elif "기혼" in user_message:
-        updated_profile = _append_profile_field(updated_profile, "혼인", "기혼")
-
-    for location in ["수도권", "서울", "경기", "인천", "부산", "대구"]:
-        if location in user_message:
-            updated_profile = _append_profile_field(updated_profile, "거주지", location)
-            break
-
-    for job in ["중소기업", "대학생", "구직", "프리랜서", "직장인"]:
-        if job in user_message:
-            updated_profile = _append_profile_field(updated_profile, "직업", job)
-            break
-
-    return updated_profile
+        updated = profile.strip()
+        if isinstance(parsed, dict) and parsed:
+            for fn, value in parsed.items():
+                if fn and value and isinstance(value, str):
+                    updated = _append_profile_field(updated, fn, value.strip())
+        else:
+            if field_name:
+                updated = _append_profile_field(updated, field_name, user_message.strip())
+        return updated
+    except Exception:
+        if field_name:
+            return _append_profile_field(profile.strip(), field_name, user_message.strip())
+        return profile.strip()
 
 
 def run(profile: str, pdf_path: Optional[str] = None) -> str:
@@ -274,30 +322,32 @@ def run(profile: str, pdf_path: Optional[str] = None) -> str:
     if not os.path.exists(actual_pdf_path):
         raise FileNotFoundError(f"PDF 파일을 찾을 수 없습니다: {actual_pdf_path}")
 
-    print(f"\n📄 PDF 파싱 중: {actual_pdf_path}")
-    parsed_doc = call_document_parse(actual_pdf_path)
+    print(f"\n📄 PDF 파싱 및 정보 추출 중 : {actual_pdf_path}")
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future_parse = executor.submit(call_document_parse, actual_pdf_path)
+        future_ie = executor.submit(_safe_information_extract, actual_pdf_path)
+        parsed_doc = future_parse.result()
+        ie_extract = future_ie.result()
     policy_text = _policy_text_from_parsed_doc(parsed_doc)
-    print(f"[DEBUG] parse: keys={list(parsed_doc.keys())[:5]}, policy_len={len(policy_text)}")
-    ie_extract = _safe_information_extract(actual_pdf_path)
-    print(f"[DEBUG] IE: has_extract={bool(ie_extract)}, extract_len={len(ie_extract or '')}")
     print("✅ PDF 파싱 완료\n")
 
-    # Plan 단계
-    print("🔍 정책 분석 중...")
-    plan_result = _plan_phase(profile=profile, policy_text=policy_text, ie_extract=ie_extract)
+    profile_for_prompts = _get_structured_profile(profile)
+
+    # Plan 단계 (1차 분석: 조건 판단·질문 생성)
+    print("🔍 Plan (1차 분석): 조건 판단·질문 생성 중...")
+    plan_result = _plan_phase(profile=profile_for_prompts, policy_text=policy_text, ie_extract=ie_extract)
     c, u, q, a = (
         plan_result.get("certain_conditions", []),
         plan_result.get("uncertain_conditions", []),
         plan_result.get("questions", []),
         plan_result.get("action_candidates", []),
     )
-    print(f"[DEBUG] plan: certain={len(c)}, uncertain={len(u)}, questions={len(q)}, candidates={len(a)}")
     print("✅ 분석 완료\n")
 
     answered_fields: Dict[str, str] = {}
 
     # 대화형 질문/응답 (항상 실행)
-    questions = _filter_questions(profile, plan_result.get("questions", []))
+    questions = _filter_questions_llm(profile_for_prompts, plan_result.get("questions", []))
     if questions:
         print("━" * 50)
         print("📋 추가 정보가 필요합니다:")
@@ -318,35 +368,36 @@ def run(profile: str, pdf_path: Optional[str] = None) -> str:
             if not answer:
                 continue
 
+            profile = _update_profile_from_message_llm(
+                profile, answer,
+                question_text=question_text or "",
+                field_name=field_name or "",
+            )
             if field_name:
-                profile = _append_profile_field(profile, field_name, answer)
                 answered_fields[field_name] = answer
-            profile = _update_profile_from_message(profile, answer)
-            print(f"[DEBUG] 반영: field={field_name}, answered={list(answered_fields.keys())}")
 
         # 재평가
-        print("\n🔄 정보를 반영하여 재분석 중...")
-        plan_result = _plan_phase(profile=profile, policy_text=policy_text, ie_extract=ie_extract)
-        print(f"[DEBUG] 재분석: questions={len(plan_result.get('questions', []))}")
-        print("✅ 재분석 완료\n")
+        print("\n🔄 Plan 재분석 중...")
+        profile_for_prompts = _get_structured_profile(profile)
+        plan_result = _plan_phase(profile=profile_for_prompts, policy_text=policy_text, ie_extract=ie_extract)
+        print("✅ Plan 재분석 완료\n")
 
     # Final 단계
     print("📝 최종 상담 결과 생성 중...")
     plan_json = json.dumps(plan_result, ensure_ascii=False)
     answered_json = json.dumps(answered_fields, ensure_ascii=False) if answered_fields else None
     prompt = build_solar_prompt(
-        profile=profile,
+        profile=profile_for_prompts,
         policy_text=policy_text,
         agent_plan=plan_json,
         answered_fields=answered_json,
         ie_extract=ie_extract,
     )
-    output = call_solar(prompt)
-    print(f"[DEBUG] final: has_headers={all(h in output for h in REQUIRED_HEADERS)}")
+    output = call_solar(prompt, reasoning_effort="medium")
     print("✅ 완료\n")
 
     print("━" * 50)
     print("📌 최종 상담 결과")
     print("━" * 50)
 
-    return _ensure_required_headers(output)
+    return _ensure_required_headers(_clean_terminal_output(output))

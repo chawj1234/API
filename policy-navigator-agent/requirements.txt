@@ -1,4 +1,4 @@
 python-dotenv
 requests
 typer
-openai==1.52.2
+openai>=1.81.0
