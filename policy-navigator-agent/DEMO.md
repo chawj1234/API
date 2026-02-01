@@ -79,6 +79,8 @@ UPSTAGE_BASE_URL=https://api.upstage.ai
 SOLAR_MODEL=solar-pro3
 ```
 
+> **Solar Pro 3** (기본 권장): [Upstage Solar Pro 3 소개](https://www.upstage.ai/blog/ko/solar-pro-3-0127) — 추론·지시 이행 강화, (**Free access ~26.03.02**)
+
 ### Step 5. 데모 실행
 ```bash
 # 기본: 금융·재정·조세 정책 (data/finance_policy.pdf)
